@@ -1,9 +1,14 @@
+import asyncio
 import time
 import os
 from openai import OpenAI
 import json
 import subprocess
 import dotenv
+from textual import on
+from textual.app import App, ComposeResult
+from textual.containers import VerticalScroll
+from textual.widgets import Footer, Header, Input, Label, Markdown
 
 dotenv.load_dotenv()
 
@@ -135,8 +140,9 @@ tools = {
 llm_tools = [{**v["tool"], "name": k} for k, v in tools.items()]
 
 
-class MaybeAgent:
+class MaybeAgent(App):
     def __init__(self):
+        super().__init__()
         self.usage = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -185,15 +191,17 @@ Remember: You're designed to be helpful while giving the user full control over 
         print(f"Function call output: {ret['output'][:256]}{'...' if len(ret['output']) > 256 else ''}")
         return ret
 
-    def async_request(self):
-        stream = self.client.responses.create(
+    async def async_request(self):
+        streamed_response = self.client.responses.create(
             tools=llm_tools,
             input=self.input_list,
             temperature=0,
             stream=True,
         )
+        markdown_widget = self.query(Markdown).last()
+        stream = Markdown.get_stream(markdown_widget)
         ret = None
-        for event in stream:
+        for event in streamed_response:
             if event.type == "response.created":
                 pass
             elif event.type == "response.in_progress":
@@ -203,12 +211,14 @@ Remember: You're designed to be helpful while giving the user full control over 
                 "response.output_text.delta",
                 "response.function_call_arguments.delta",
             ]:
-                print(event.delta, end="")
+                # print(event.delta, end="")
+                await stream.write(event.delta)
             elif event.type == "response.completed":
                 ret = event.response
                 pass
             elif event.type == "response.output_item.added":
-                print(f"\n###{event.item.type}")
+                # print(f"\n###{event.item.type}")
+                await stream.write(f"\n###{event.item.type}\n")
             elif event.type in [
                 "response.content_part.added",
                 "response.content_part.done",
@@ -218,15 +228,17 @@ Remember: You're designed to be helpful while giving the user full control over 
                 # print(event.type)
                 pass
             else:
-                print(f"Unknown event type: {event.type}")
+                # print(f"Unknown event type: {event.type}")
+                await stream.write(f"\nUnknown event type: {event.type}\n")
+        await stream.stop()
         return ret
 
-    def request_loop(self):
+    async def request_loop(self):
         ready = False
         res = ""
         while not ready:
             ready = True
-            ret = self.async_request()
+            ret = await self.async_request()
             self.usage["input_tokens"] = ret.usage.input_tokens
             self.usage["output_tokens"] = ret.usage.output_tokens
             self.usage["total_tokens"] = ret.usage.total_tokens
@@ -256,7 +268,7 @@ Remember: You're designed to be helpful while giving the user full control over 
             }
         )
 
-    def run(self):
+    def main_loop(self):
         while True:
             try:
                 user_input = input(">>> ")
@@ -265,6 +277,22 @@ Remember: You're designed to be helpful while giving the user full control over 
                 break
             self.add_prompt(user_input)
             self.request_loop()
+    
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer()
+        yield VerticalScroll(Input())
+    
+    @on(Input.Submitted)
+    async def on_input_submitted(self, event: Input.Submitted):
+        input = self.query_one(Input)
+        input.remove()
+        scroll = self.query_one(VerticalScroll)
+        scroll.mount(Label(input.value))
+        scroll.mount(Markdown())
+        self.add_prompt(input.value)
+        await self.request_loop()
+        scroll.mount(Input())
 
 
 def main():
