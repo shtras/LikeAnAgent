@@ -1,7 +1,5 @@
-import asyncio
-import time
 import os
-from openai import OpenAI
+from openai import AsyncOpenAI
 import json
 import subprocess
 import dotenv
@@ -148,7 +146,9 @@ class MaybeAgent(App):
             "output_tokens": 0,
             "total_tokens": 0,
         }
-        self.client = OpenAI(base_url=os.environ["OPENAI_HOST"], api_key=os.environ["OPENAI_KEY"])
+        self.client = AsyncOpenAI(
+            base_url=os.environ["OPENAI_HOST"], api_key=os.environ["OPENAI_KEY"]
+        )
         self.input_list = [
             {
                 "role": "system",
@@ -192,7 +192,7 @@ Remember: You're designed to be helpful while giving the user full control over 
         return ret
 
     async def async_request(self):
-        streamed_response = self.client.responses.create(
+        streamed_response = await self.client.responses.create(
             tools=llm_tools,
             input=self.input_list,
             temperature=0,
@@ -201,7 +201,7 @@ Remember: You're designed to be helpful while giving the user full control over 
         markdown_widget = self.query(Markdown).last()
         stream = Markdown.get_stream(markdown_widget)
         ret = None
-        for event in streamed_response:
+        async for event in streamed_response:
             if event.type == "response.created":
                 pass
             elif event.type == "response.in_progress":
@@ -281,18 +281,22 @@ Remember: You're designed to be helpful while giving the user full control over 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Footer()
-        yield VerticalScroll(Input())
+        new_input = Input()
+        new_input.focus()
+        yield VerticalScroll(new_input)
     
     @on(Input.Submitted)
     async def on_input_submitted(self, event: Input.Submitted):
-        input = self.query_one(Input)
-        input.remove()
+        prompt = event.value
+        event.input.remove()
         scroll = self.query_one(VerticalScroll)
-        scroll.mount(Label(input.value))
+        scroll.mount(Label(prompt))
         scroll.mount(Markdown())
-        self.add_prompt(input.value)
+        self.add_prompt(prompt)
         await self.request_loop()
-        scroll.mount(Input())
+        new_input = Input()
+        new_input.focus()
+        scroll.mount(new_input)
 
 
 def main():
