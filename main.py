@@ -1,12 +1,15 @@
+import asyncio
 import os
 from openai import AsyncOpenAI
 import json
 import subprocess
 import dotenv
-from textual import on
+from textual import on, work
 from textual.app import App, ComposeResult
-from textual.containers import VerticalScroll
-from textual.widgets import Footer, Header, Input, Label, Markdown
+from textual.containers import Container, Grid, VerticalScroll
+from textual.screen import ModalScreen, Screen
+from textual.widgets import Button, Footer, Header, Input, Label, Markdown, RadioSet
+from textual.worker import Worker, WorkerState
 
 dotenv.load_dotenv()
 
@@ -19,128 +22,48 @@ light_state = {
 class PermissionDenied(Exception):
     pass
 
+
 class UserObjection(Exception):
     pass
 
 
-def ask_permission(prompt: str):
-    print(prompt)
-    res = input("Allow? [q/y/N] ")
-    if res.lower() == "q":
-        user_response = input(">>> ")
-        raise UserObjection(user_response)
-    if res.lower() != "y":
-        raise PermissionDenied("User denied permission")
+class PermissionScreen(ModalScreen):
+    def __init__(self, prompt: str):
+        super().__init__()
+        self.prompt = prompt
+        self.result = None
 
-
-def read_file(file_path: str):
-    try:
-        with open(file_path, "r") as f:
-            return f.read()
-    except FileNotFoundError:
-        return "File not found"
-
-
-def write_file(file_path: str, content: str):
-    try:
-        ask_permission(f"Do you want to write to {file_path}?")
-    except PermissionDenied:
-        return "The user didn't allow to modify this file"
-    except UserObjection as e:
-        return f"The user objected: {str(e)}"
-    
-    with open(file_path, "w") as f:
-        f.write(content)
-    return "ok"
-
-
-def bash(command: str):
-    try:
-        ask_permission(f"Do you want to execute the command: {command}?")
-    except PermissionDenied:
-        return "The user didn't allow to execute this command"
-    except UserObjection as e:
-        return f"The user objected: {str(e)}"
-    try:
-        res = subprocess.run(command, shell=True, capture_output=True, text=True)
-        return json.dumps(
-            {
-                "stdout": res.stdout,
-                "stderr": res.stderr,
-                "returncode": res.returncode,
-            }
+    def compose(self) -> ComposeResult:
+        yield Grid(
+            Label(self.prompt),
+            Button("Allow", id="allow"),
+            Button("Deny", id="deny"),
+            Input(placeholder="Provide input", id="objection_input"),
+            id="dialog",
         )
-    except Exception as e:
-        return str(e)
 
-
-tools = {
-    "read_file": {
-        "tool": {
-            "type": "function",
-            "description": "Read the content of a file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "The path to the file to read.",
-                    },
-                },
-                "required": ["file_path"],
-                "additionalProperties": False,
-            },
-        },
-        "function": read_file,
-    },
-    "write_file": {
-        "tool": {
-            "type": "function",
-            "description": "Write content to a file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "The path to the file to write. The user will be asked for permission before writing to the file.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The content to write to the file.",
-                    },
-                },
-                "required": ["file_path", "content"],
-                "additionalProperties": False,
-            },
-        },
-        "function": write_file,
-    },
-    "bash": {
-        "tool": {
-            "type": "function",
-            "description": "Execute a bash command. The user will be asked for permission before executing the command.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The bash command to execute.",
-                    },
-                },
-                "required": ["command"],
-                "additionalProperties": False,
-            },
-        },
-        "function": bash,
-    },
-}
-
-llm_tools = [{**v["tool"], "name": k} for k, v in tools.items()]
+    @on(Button.Pressed)
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "allow":
+            self.result = "Allow"
+        elif event.button.id == "deny":
+            self.result = "Deny"
+        else:
+            self.result = "Provide Input"
+        self.dismiss(self.result)
+    
+    @on(Input.Submitted)
+    def on_input_submitted(self, event: Input.Submitted):
+        self.result = event.value
+        event.stop()
+        self.dismiss(self.result)
 
 
 class MaybeAgent(App):
     def __init__(self):
         super().__init__()
+        self._event = None
+        self._response = None
         self.usage = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -149,6 +72,68 @@ class MaybeAgent(App):
         self.client = AsyncOpenAI(
             base_url=os.environ["OPENAI_HOST"], api_key=os.environ["OPENAI_KEY"]
         )
+        self.tools = {
+            "read_file": {
+                "tool": {
+                    "type": "function",
+                    "description": "Read the content of a file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {
+                                "type": "string",
+                                "description": "The path to the file to read.",
+                            },
+                        },
+                        "required": ["file_path"],
+                        "additionalProperties": False,
+                    },
+                },
+                "function": self.read_file,
+            },
+            "write_file": {
+                "tool": {
+                    "type": "function",
+                    "description": "Write content to a file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {
+                                "type": "string",
+                                "description": "The path to the file to write. The user will be asked for permission before writing to the file.",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "The content to write to the file.",
+                            },
+                        },
+                        "required": ["file_path", "content"],
+                        "additionalProperties": False,
+                    },
+                },
+                "function": self.write_file,
+            },
+            "bash": {
+                "tool": {
+                    "type": "function",
+                    "description": "Execute a bash command. The user will be asked for permission before executing the command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "The bash command to execute.",
+                            },
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+                "function": self.bash,
+            },
+        }
+
+        self.llm_tools = [{**v["tool"], "name": k} for k, v in self.tools.items()]
         self.input_list = [
             {
                 "role": "system",
@@ -177,23 +162,73 @@ Remember: You're designed to be helpful while giving the user full control over 
             },
         ]
 
-    def function_call(self, name: str, args: dict, call_id: str):
+    async def ask_permission(self, prompt: str):
+        screen = PermissionScreen(prompt)
+        result = await self.push_screen_wait(screen)
+        if result == "Allow":
+            return True
+        elif result == "Deny":
+            raise PermissionDenied()
+        else:
+            raise UserObjection(result)
+
+    async def read_file(self, file_path: str):
+        try:
+            with open(file_path, "r") as f:
+                return f.read()
+        except FileNotFoundError:
+            return "File not found"
+
+    async def write_file(self, file_path: str, content: str):
+        try:
+            await self.ask_permission(f"Do you want to write to {file_path}?")
+        except PermissionDenied:
+            return "The user didn't allow to modify this file"
+        except UserObjection as e:
+            return f"The user objected: {str(e)}"
+
+        with open(file_path, "w") as f:
+            f.write(content)
+        return "ok"
+
+    async def bash(self, command: str):
+        try:
+            await self.ask_permission(f"Do you want to execute the command: {command}?")
+        except PermissionDenied:
+            return "The user didn't allow to execute this command"
+        except UserObjection as e:
+            return f"The user objected: {str(e)}"
+        try:
+            res = subprocess.run(command, shell=True, capture_output=True, text=True)
+            return json.dumps(
+                {
+                    "stdout": res.stdout,
+                    "stderr": res.stderr,
+                    "returncode": res.returncode,
+                }
+            )
+        except Exception as e:
+            return str(e)
+
+    async def function_call(self, name: str, args: dict, call_id: str):
         ret = {
             "type": "function_call_output",
             "call_id": call_id,
         }
         print(f"Function call: {name} with args {args}")
         ret["output"] = (
-            tools[name]["function"](**args) or "ok"
-            if name in tools
+            await self.tools[name]["function"](**args) or "ok"
+            if name in self.tools
             else "unknown function"
         )
-        print(f"Function call output: {ret['output'][:256]}{'...' if len(ret['output']) > 256 else ''}")
+        print(
+            f"Function call output: {ret['output'][:256]}{'...' if len(ret['output']) > 256 else ''}"
+        )
         return ret
 
     async def async_request(self):
         streamed_response = await self.client.responses.create(
-            tools=llm_tools,
+            tools=self.llm_tools,
             input=self.input_list,
             temperature=0,
             stream=True,
@@ -233,6 +268,7 @@ Remember: You're designed to be helpful while giving the user full control over 
         await stream.stop()
         return ret
 
+    @work(exclusive=True)
     async def request_loop(self):
         ready = False
         res = ""
@@ -246,7 +282,7 @@ Remember: You're designed to be helpful while giving the user full control over 
             for item in ret.output:
                 if item.type == "function_call":
                     self.input_list.append(
-                        self.function_call(
+                        await self.function_call(
                             item.name, json.loads(item.arguments), item.call_id
                         )
                     )
@@ -268,35 +304,30 @@ Remember: You're designed to be helpful while giving the user full control over 
             }
         )
 
-    def main_loop(self):
-        while True:
-            try:
-                user_input = input(">>> ")
-            except KeyboardInterrupt:
-                print("Bye")
-                break
-            self.add_prompt(user_input)
-            self.request_loop()
-    
     def compose(self) -> ComposeResult:
         yield Header()
         yield Footer()
-        new_input = Input()
+        new_input = Input(id="main_input")
         new_input.focus()
         yield VerticalScroll(new_input)
-    
+
     @on(Input.Submitted)
     async def on_input_submitted(self, event: Input.Submitted):
+        print("Main input submitted!!!")
         prompt = event.value
         event.input.remove()
         scroll = self.query_one(VerticalScroll)
         scroll.mount(Label(prompt))
         scroll.mount(Markdown())
         self.add_prompt(prompt)
-        await self.request_loop()
+        self.request_loop()
         new_input = Input()
         new_input.focus()
         scroll.mount(new_input)
+    
+    def on_worker_state_changed(self, event: Worker.StateChanged):
+        print(f"Worker state changed: {event.worker} is now {event.state}")
+        
 
 
 def main():
