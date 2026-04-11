@@ -13,11 +13,6 @@ from textual.worker import Worker, WorkerState
 
 dotenv.load_dotenv()
 
-light_state = {
-    "living_room": "off",
-    "kitchen": "off",
-}
-
 
 class PermissionDenied(Exception):
     pass
@@ -35,7 +30,7 @@ class PermissionScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         yield Grid(
-            Label(self.prompt),
+            Label(self.prompt, id="question"),
             Button("Allow", id="allow"),
             Button("Deny", id="deny"),
             Input(placeholder="Provide input", id="objection_input"),
@@ -51,7 +46,7 @@ class PermissionScreen(ModalScreen):
         else:
             self.result = "Provide Input"
         self.dismiss(self.result)
-    
+
     @on(Input.Submitted)
     def on_input_submitted(self, event: Input.Submitted):
         self.result = event.value
@@ -59,7 +54,9 @@ class PermissionScreen(ModalScreen):
         self.dismiss(self.result)
 
 
-class MaybeAgent(App):
+class LikeAnAgent(App):
+    CSS_PATH = "likeanagent.tcss"
+
     def __init__(self):
         super().__init__()
         self._event = None
@@ -113,6 +110,28 @@ class MaybeAgent(App):
                 },
                 "function": self.write_file,
             },
+            "patch_file": {
+                "tool": {
+                    "type": "function",
+                    "description": "Apply a unified diff patch to a file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {
+                                "type": "string",
+                                "description": "The path to the file to patch. The user will be asked for permission before applying the patch.",
+                            },
+                            "diff": {
+                                "type": "string",
+                                "description": "The unified diff to apply to the file.",
+                            },
+                        },
+                        "required": ["file_path", "diff"],
+                        "additionalProperties": False,
+                    },
+                },
+                "function": self.patch,
+            },
             "bash": {
                 "tool": {
                     "type": "function",
@@ -143,11 +162,13 @@ Key principles:
 1. Always explain what you plan to do before performing actions that require permission
 2. Be transparent about your reasoning and thought process
 3. When uncertain, ask clarifying questions rather than making assumptions
-4. Use the available tools (read_file, write_file, bash) judiciously to help the user
+4. Use the available tools (read_file, write_file, patch_file, bash) judiciously to help the user
 5. Respect user decisions when they decline permission for an action
+6. **PRIORITY: When modifying files, prefer using unified diffs/patches to minimize unintended changes and make it clear what will be modified. Only use full rewrites when absolutely necessary, and explain why.**
 
 Your capabilities:
 - Read and write files in the current directory
+- Apply unified diff patches to files
 - Execute shell commands (with user permission)
 - Maintain context across conversations
 - Help with tasks like organizing notes, managing lists, and automating simple file operations
@@ -155,6 +176,8 @@ Your capabilities:
 When responding:
 - Be concise but thorough
 - Use natural language explanations for your actions
+- When suggesting file modifications, explain whether you'll use a full rewrite or a diff/patch approach
+- Explain the benefits of your chosen approach (e.g., "using a diff will only change the specific lines needed")
 - Acknowledge when you've completed a task successfully
 - If something goes wrong, explain what happened and suggest alternatives
 
@@ -210,6 +233,41 @@ Remember: You're designed to be helpful while giving the user full control over 
         except Exception as e:
             return str(e)
 
+    async def patch(self, file_path: str, diff: str):
+        try:
+            await self.ask_permission(
+                f"Do you want to apply the following patch to {file_path}?\n\n{diff}"
+            )
+        except PermissionDenied:
+            return "The user didn't allow to modify this file"
+        except UserObjection as e:
+            return f"The user objected: {str(e)}"
+
+        # For simplicity, we'll just write the diff to a temporary file and apply it using the `patch` command
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+            tmp.write(diff)
+            tmp_path = tmp.name
+
+        try:
+            res = subprocess.run(
+                f"patch {file_path} {tmp_path}",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            os.unlink(tmp_path)
+            return json.dumps(
+                {
+                    "stdout": res.stdout,
+                    "stderr": res.stderr,
+                    "returncode": res.returncode,
+                }
+            )
+        except Exception as e:
+            return str(e)
+
     async def function_call(self, name: str, args: dict, call_id: str):
         ret = {
             "type": "function_call_output",
@@ -227,6 +285,10 @@ Remember: You're designed to be helpful while giving the user full control over 
         return ret
 
     async def async_request(self):
+        event_types = {
+            "function_call": "Function call",
+            "message": "Message",
+        }
         streamed_response = await self.client.responses.create(
             tools=self.llm_tools,
             input=self.input_list,
@@ -252,8 +314,13 @@ Remember: You're designed to be helpful while giving the user full control over 
                 ret = event.response
                 pass
             elif event.type == "response.output_item.added":
-                # print(f"\n###{event.item.type}")
-                await stream.write(f"\n###{event.item.type}\n")
+                print(f"\n###{event}")
+                await stream.write(
+                    f"\n\n### {event_types.get(event.item.type, event.item.type)}\n"
+                )
+                # if event.item.type == 'function_call':
+                #     await stream.write(f"|Name|Arguments|\n| -------- | ------- |\n|{event.item.name}|{event.item.arguments}|\n")
+                await stream.write("\n\n")
             elif event.type in [
                 "response.content_part.added",
                 "response.content_part.done",
@@ -266,12 +333,18 @@ Remember: You're designed to be helpful while giving the user full control over 
                 # print(f"Unknown event type: {event.type}")
                 await stream.write(f"\nUnknown event type: {event.type}\n")
         await stream.stop()
+        ret.output = [
+            item.to_dict() if not isinstance(item, dict) else item
+            for item in ret.output
+        ]
         return ret
 
     @work(exclusive=True)
     async def request_loop(self):
         ready = False
         res = ""
+        widget = self.query(Markdown).last()
+        self.set_status("Processing...")
         while not ready:
             ready = True
             ret = await self.async_request()
@@ -280,21 +353,32 @@ Remember: You're designed to be helpful while giving the user full control over 
             self.usage["total_tokens"] = ret.usage.total_tokens
             self.input_list += ret.output
             for item in ret.output:
-                if item.type == "function_call":
-                    self.input_list.append(
-                        await self.function_call(
-                            item.name, json.loads(item.arguments), item.call_id
-                        )
+                if item["type"] == "function_call":
+                    await widget.append(
+                        f"\n|Name|Arguments|\n| -------- | ------- |\n|{item['name']}|{item['arguments']}|\n"
                     )
+                    function_output = await self.function_call(
+                        item["name"], json.loads(item["arguments"]), item["call_id"]
+                    )
+                    await widget.append(
+                        f"\nOutput:\n```\n{function_output['output'][:512]}{'...' if len(function_output['output']) > 512 else ''}\n```\n"
+                    )
+                    self.input_list.append(function_output)
                     ready = False
-                elif item.type == "message":
-                    res = item.content[0].text
-                elif item.type in ["reasoning"]:
+                elif item["type"] == "message":
+                    res = item["content"][0]["text"]
+                elif item["type"] in ["reasoning"]:
                     pass
                 else:
-                    print(f"Unknown output item type: {item.type}")
+                    print(f"Unknown output item type: {item['type']}")
+
+        self.set_status(f"Tokens used: {self.usage['total_tokens']}")
         print(f"\nTokens used: {self.usage['total_tokens']}")
         return res
+
+    def set_status(self, status: str):
+        usage_label = self.query_one("#Status", Label)
+        usage_label.update(status)
 
     def add_prompt(self, prompt: str):
         self.input_list.append(
@@ -310,6 +394,7 @@ Remember: You're designed to be helpful while giving the user full control over 
         new_input = Input(id="main_input")
         new_input.focus()
         yield VerticalScroll(new_input)
+        yield Label("Status", id="Status")
 
     @on(Input.Submitted)
     async def on_input_submitted(self, event: Input.Submitted):
@@ -322,16 +407,15 @@ Remember: You're designed to be helpful while giving the user full control over 
         self.add_prompt(prompt)
         self.request_loop()
         new_input = Input()
-        new_input.focus()
         scroll.mount(new_input)
-    
+        new_input.focus()
+
     def on_worker_state_changed(self, event: Worker.StateChanged):
         print(f"Worker state changed: {event.worker} is now {event.state}")
-        
 
 
 def main():
-    agent = MaybeAgent()
+    agent = LikeAnAgent()
     agent.run()
 
 
