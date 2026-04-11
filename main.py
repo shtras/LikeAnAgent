@@ -31,9 +31,9 @@ class PermissionScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         yield Grid(
             Label(self.prompt, id="question"),
-            Button("Allow", id="allow"),
-            Button("Deny", id="deny"),
-            Input(placeholder="Provide input", id="objection_input"),
+            Button("Allow", id="allow", variant="success"),
+            Button("Deny", id="deny", variant="error"),
+            Input(placeholder="Objection clarification", id="objection_input"),
             id="dialog",
         )
 
@@ -61,6 +61,7 @@ class LikeAnAgent(App):
         super().__init__()
         self._event = None
         self._response = None
+        self._prompt = None
         self.usage = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -295,6 +296,9 @@ Remember: You're designed to be helpful while giving the user full control over 
             temperature=0,
             stream=True,
         )
+        def follow_chat() -> None:
+            scroll = self.query_one(VerticalScroll)
+            self.call_after_refresh(scroll.scroll_end, animate=False)
         markdown_widget = self.query(Markdown).last()
         stream = Markdown.get_stream(markdown_widget)
         ret = None
@@ -310,6 +314,7 @@ Remember: You're designed to be helpful while giving the user full control over 
             ]:
                 # print(event.delta, end="")
                 await stream.write(event.delta)
+                follow_chat()
             elif event.type == "response.completed":
                 ret = event.response
                 pass
@@ -391,24 +396,26 @@ Remember: You're designed to be helpful while giving the user full control over 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Footer()
-        new_input = Input(id="main_input")
-        new_input.focus()
-        yield VerticalScroll(new_input)
+        yield VerticalScroll()
+        self._prompt = Input(id="main_input")
+        self._prompt.focus()
+        yield self._prompt
         yield Label("Status", id="Status")
 
     @on(Input.Submitted)
     async def on_input_submitted(self, event: Input.Submitted):
         print("Main input submitted!!!")
         prompt = event.value
-        event.input.remove()
+        # event.input.remove()
         scroll = self.query_one(VerticalScroll)
-        scroll.mount(Label(prompt))
+        scroll.mount(Label(prompt, classes="user_prompt"))
         scroll.mount(Markdown())
         self.add_prompt(prompt)
+        self._prompt.value = ""
         self.request_loop()
-        new_input = Input()
-        scroll.mount(new_input)
-        new_input.focus()
+        # new_input = Input()
+        # scroll.mount(new_input)
+        self._prompt.focus()
 
     def on_worker_state_changed(self, event: Worker.StateChanged):
         print(f"Worker state changed: {event.worker} is now {event.state}")
