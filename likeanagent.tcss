@@ -6,6 +6,12 @@ PermissionScreen {
     column-span: 2;
 }
 
+#main_input {
+    min-height: 3;
+    height: 3;
+    max-height: 10;  /* stop growing after this */
+}
+
 #dialog {
     grid-size: 2;
     padding: 0 1;

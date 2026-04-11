@@ -1,4 +1,3 @@
-import asyncio
 import os
 from openai import AsyncOpenAI
 import json
@@ -6,10 +5,13 @@ import subprocess
 import dotenv
 from textual import on, work
 from textual.app import App, ComposeResult
-from textual.containers import Container, Grid, VerticalScroll
-from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Footer, Header, Input, Label, Markdown, RadioSet
-from textual.worker import Worker, WorkerState
+from textual.containers import Grid, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import Button, Footer, Header, Input, Label, Markdown
+from textual.worker import Worker
+from textual import events
+from textual.message import Message
+from textual.widgets import TextArea
 
 dotenv.load_dotenv()
 
@@ -21,6 +23,27 @@ class PermissionDenied(Exception):
 class UserObjection(Exception):
     pass
 
+class ChatInput(TextArea):
+    class Submitted(Message):
+        def __init__(self, chat_input: "ChatInput", value: str) -> None:
+            self.chat_input = chat_input
+            self.value = value
+            super().__init__()
+
+    def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.prevent_default()
+            event.stop()
+            self.post_message(self.Submitted(self, self.text))
+            return
+
+        if event.key in  ["shift+enter", "ctrl+j", "ctrl+enter"]:
+            event.prevent_default()
+            event.stop()
+            self.insert("\n")
+            return
+
+        super()._on_key(event)
 
 class PermissionScreen(ModalScreen):
     def __init__(self, prompt: str):
@@ -397,25 +420,30 @@ Remember: You're designed to be helpful while giving the user full control over 
         yield Header()
         yield Footer()
         yield VerticalScroll()
-        self._prompt = Input(id="main_input")
+        self._prompt = ChatInput(id="main_input")
         self._prompt.focus()
         yield self._prompt
         yield Label("Status", id="Status")
 
-    @on(Input.Submitted)
-    async def on_input_submitted(self, event: Input.Submitted):
-        print("Main input submitted!!!")
-        prompt = event.value
-        # event.input.remove()
+    @on(ChatInput.Submitted)
+    async def on_input_submitted(self, event: ChatInput.Submitted):
+        prompt = event.value.strip()
+        if not prompt:
+            return
         scroll = self.query_one(VerticalScroll)
         scroll.mount(Label(prompt, classes="user_prompt"))
         scroll.mount(Markdown())
         self.add_prompt(prompt)
-        self._prompt.value = ""
+        self._prompt.clear()
+        self._prompt.styles.height = 3
         self.request_loop()
-        # new_input = Input()
-        # scroll.mount(new_input)
         self._prompt.focus()
+    
+    @on(ChatInput.Changed)
+    def on_chat_input_changed(self, event: ChatInput.Changed) -> None:
+        text_area = event.text_area
+        target_height = min(10, max(3, text_area.document.line_count + 2))
+        text_area.styles.height = target_height
 
     def on_worker_state_changed(self, event: Worker.StateChanged):
         print(f"Worker state changed: {event.worker} is now {event.state}")
