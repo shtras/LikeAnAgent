@@ -1,8 +1,11 @@
+import datetime
 import os
+import urllib
 from openai import AsyncOpenAI
 import json
 import subprocess
 import dotenv
+import asyncio
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Grid, VerticalScroll
@@ -12,6 +15,7 @@ from textual.worker import Worker
 from textual import events
 from textual.message import Message
 from textual.widgets import TextArea
+import requests
 
 dotenv.load_dotenv()
 
@@ -30,7 +34,7 @@ class ChatInput(TextArea):
             self.value = value
             super().__init__()
 
-    def _on_key(self, event: events.Key) -> None:
+    async def _on_key(self, event: events.Key) -> None:
         if event.key == "enter":
             event.prevent_default()
             event.stop()
@@ -43,7 +47,7 @@ class ChatInput(TextArea):
             self.insert("\n")
             return
 
-        super()._on_key(event)
+        await super()._on_key(event)
 
 class PermissionScreen(ModalScreen):
     def __init__(self, prompt: str):
@@ -174,13 +178,45 @@ class LikeAnAgent(App):
                 },
                 "function": self.bash,
             },
+            "web_search": {
+                "tool": {
+                    "type": "function",
+                    "description": "Perform a web search using DuckDuckGo. The user will be asked for permission before performing the search.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query.",
+                            },
+                        },
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                },
+                "function": self.web_search,
+            },
+            "get_date_time": {
+                "tool": {
+                    "type": "function",
+                    "description": "Get the current date and time.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                },
+                "function": lambda: json.dumps({"date_time": datetime.datetime.now().isoformat()}),
+            }
         }
 
         self.llm_tools = [{**v["tool"], "name": k} for k, v in self.tools.items()]
         self.input_list = [
             {
                 "role": "system",
-                "content": """You are a helpful and cautious AI assistant with access to file system operations and shell commands. Your primary goal is to assist the user effectively while prioritizing safety and clarity.
+                "content": f"""You are a helpful and cautious AI assistant with access to file system operations and shell commands. Your primary goal is to assist the user effectively while prioritizing safety and clarity.
+
+The current date and time is {datetime.datetime.now().isoformat()}.
 
 Key principles:
 1. Always explain what you plan to do before performing actions that require permission
@@ -188,14 +224,19 @@ Key principles:
 3. When uncertain, ask clarifying questions rather than making assumptions
 4. Use the available tools (read_file, write_file, patch_file, bash) judiciously to help the user
 5. Respect user decisions when they decline permission for an action
-6. **PRIORITY: When modifying files, prefer using unified diffs/patches to minimize unintended changes and make it clear what will be modified. Only use full rewrites when absolutely necessary, and explain why.**
+6. When modifying files, prefer using unified diffs/patches to minimize unintended changes and make it clear what will be modified. Only use full rewrites when absolutely necessary, and explain why.
+7. You can fetch followup information for the web search using curl
+8. If a user is asking a generic question, assume they refer to the present time, {datetime.datetime.now().isoformat()}.
 
 Your capabilities:
 - Read and write files in the current directory
 - Apply unified diff patches to files
 - Execute shell commands (with user permission)
+- Get current date and time
+- Perform web searches (with user permission)
 - Maintain context across conversations
 - Help with tasks like organizing notes, managing lists, and automating simple file operations
+
 
 When responding:
 - Be concise but thorough
@@ -246,7 +287,9 @@ Remember: You're designed to be helpful while giving the user full control over 
         except UserObjection as e:
             return f"The user objected: {str(e)}"
         try:
-            res = subprocess.run(command, shell=True, capture_output=True, text=True)
+            res = await asyncio.to_thread(
+                subprocess.run, command, shell=True, capture_output=True, text=True
+            )
             return json.dumps(
                 {
                     "stdout": res.stdout,
@@ -267,21 +310,21 @@ Remember: You're designed to be helpful while giving the user full control over 
         except UserObjection as e:
             return f"The user objected: {str(e)}"
 
-        # For simplicity, we'll just write the diff to a temporary file and apply it using the `patch` command
         import tempfile
+        import os
 
         with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
             tmp.write(diff)
             tmp_path = tmp.name
 
         try:
-            res = subprocess.run(
+            res = await asyncio.to_thread(
+                subprocess.run,
                 f"patch {file_path} {tmp_path}",
                 shell=True,
                 capture_output=True,
                 text=True,
             )
-            os.unlink(tmp_path)
             return json.dumps(
                 {
                     "stdout": res.stdout,
@@ -289,8 +332,29 @@ Remember: You're designed to be helpful while giving the user full control over 
                     "returncode": res.returncode,
                 }
             )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    
+    async def web_search(self, query: str):
+        try:
+            await self.ask_permission(f"Do you want to perform a web search for: {query}?")
+        except PermissionDenied:
+            return "The user didn't allow to perform a web search"
+        except UserObjection as e:
+            return f"The user objected: {str(e)}"
+        try:
+            searxng_url = os.environ["SEARXNG_URL"]
+            response = requests.get(f"{searxng_url}/?q={urllib.parse.quote_plus(query)}&format=json")
         except Exception as e:
-            return str(e)
+            return f"Failed to perform web search: {str(e)}"
+        if response.status_code // 100 == 2:
+            data = response.json()
+            return json.dumps(data.get("results", []))
+        else:
+            return f"Web search failed with status code {response.status_code}"
 
     async def function_call(self, name: str, args: dict, call_id: str):
         ret = {

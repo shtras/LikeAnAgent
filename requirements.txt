@@ -1,3 +1,5 @@
 openai
 dotenv
 textual
+textual-dev
+requests
