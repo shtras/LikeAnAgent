@@ -16,6 +16,7 @@ from textual import events
 from textual.message import Message
 from textual.widgets import TextArea
 import requests
+import time
 
 dotenv.load_dotenv()
 
@@ -26,6 +27,7 @@ class PermissionDenied(Exception):
 
 class UserObjection(Exception):
     pass
+
 
 class ChatInput(TextArea):
     class Submitted(Message):
@@ -41,13 +43,14 @@ class ChatInput(TextArea):
             self.post_message(self.Submitted(self, self.text))
             return
 
-        if event.key in  ["shift+enter", "ctrl+j", "ctrl+enter"]:
+        if event.key in ["shift+enter", "ctrl+j", "ctrl+enter"]:
             event.prevent_default()
             event.stop()
             self.insert("\n")
             return
 
         await super()._on_key(event)
+
 
 class PermissionScreen(ModalScreen):
     def __init__(self, prompt: str):
@@ -206,49 +209,25 @@ class LikeAnAgent(App):
                         "additionalProperties": False,
                     },
                 },
-                "function": lambda: json.dumps({"date_time": datetime.datetime.now().isoformat()}),
-            }
+                "function": lambda: json.dumps(
+                    {"date_time": datetime.datetime.now().isoformat()}
+                ),
+            },
         }
 
         self.llm_tools = [{**v["tool"], "name": k} for k, v in self.tools.items()]
         self.input_list = [
             {
                 "role": "system",
-                "content": f"""You are a helpful and cautious AI assistant with access to file system operations and shell commands. Your primary goal is to assist the user effectively while prioritizing safety and clarity.
-
-The current date and time is {datetime.datetime.now().isoformat()}.
-
-Key principles:
-1. Always explain what you plan to do before performing actions that require permission
-2. Be transparent about your reasoning and thought process
-3. When uncertain, ask clarifying questions rather than making assumptions
-4. Use the available tools (read_file, write_file, patch_file, bash) judiciously to help the user
-5. Respect user decisions when they decline permission for an action
-6. When modifying files, prefer using unified diffs/patches to minimize unintended changes and make it clear what will be modified. Only use full rewrites when absolutely necessary, and explain why.
-7. You can fetch followup information for the web search using curl
-8. If a user is asking a generic question, assume they refer to the present time, {datetime.datetime.now().isoformat()}.
-
-Your capabilities:
-- Read and write files in the current directory
-- Apply unified diff patches to files
-- Execute shell commands (with user permission)
-- Get current date and time
-- Perform web searches (with user permission)
-- Maintain context across conversations
-- Help with tasks like organizing notes, managing lists, and automating simple file operations
-
-
-When responding:
-- Be concise but thorough
-- Use natural language explanations for your actions
-- When suggesting file modifications, explain whether you'll use a full rewrite or a diff/patch approach
-- Explain the benefits of your chosen approach (e.g., "using a diff will only change the specific lines needed")
-- Acknowledge when you've completed a task successfully
-- If something goes wrong, explain what happened and suggest alternatives
-
-Remember: You're designed to be helpful while giving the user full control over potentially risky operations.""",
             },
         ]
+        with open("system_prompt.txt", "r") as f:
+            system_prompt = f.read()
+            system_prompt = system_prompt.replace(
+                "%%DATETIME%%", datetime.datetime.now().isoformat()
+            )
+            system_prompt = system_prompt.replace("%%CURRENT_PATH%%", os.getcwd())
+        self.input_list[0]["content"] = system_prompt
 
     async def ask_permission(self, prompt: str):
         screen = PermissionScreen(prompt)
@@ -337,17 +316,21 @@ Remember: You're designed to be helpful while giving the user full control over 
                 os.unlink(tmp_path)
             except OSError:
                 pass
-    
+
     async def web_search(self, query: str):
         try:
-            await self.ask_permission(f"Do you want to perform a web search for: {query}?")
+            await self.ask_permission(
+                f"Do you want to perform a web search for: {query}?"
+            )
         except PermissionDenied:
             return "The user didn't allow to perform a web search"
         except UserObjection as e:
             return f"The user objected: {str(e)}"
         try:
             searxng_url = os.environ["SEARXNG_URL"]
-            response = requests.get(f"{searxng_url}/?q={urllib.parse.quote_plus(query)}&format=json")
+            response = requests.get(
+                f"{searxng_url}/?q={urllib.parse.quote_plus(query)}&format=json"
+            )
         except Exception as e:
             return f"Failed to perform web search: {str(e)}"
         if response.status_code // 100 == 2:
@@ -372,6 +355,16 @@ Remember: You're designed to be helpful while giving the user full control over 
         )
         return ret
 
+    def request(self, prompt: str):
+        response = self.client.responses.create(
+            tools=self.llm_tools,
+            input=self.input_list,
+        )
+        for item in response.output:
+            if item.type == "message":
+                return item.content[0].text
+        return ""
+
     async def async_request(self):
         event_types = {
             "function_call": "Function call",
@@ -380,15 +373,18 @@ Remember: You're designed to be helpful while giving the user full control over 
         streamed_response = await self.client.responses.create(
             tools=self.llm_tools,
             input=self.input_list,
-            temperature=0,
             stream=True,
         )
+
         def follow_chat() -> None:
             scroll = self.query_one(VerticalScroll)
             self.call_after_refresh(scroll.scroll_end, animate=False)
+
         markdown_widget = self.query(Markdown).last()
         stream = Markdown.get_stream(markdown_widget)
         ret = None
+        tokens = 0
+        start_time = time.time()
         async for event in streamed_response:
             if event.type == "response.created":
                 pass
@@ -402,6 +398,12 @@ Remember: You're designed to be helpful while giving the user full control over 
                 # print(event.delta, end="")
                 await stream.write(event.delta)
                 follow_chat()
+                tokens += 1
+                curr_time = time.time()
+                if curr_time - start_time > 1:
+                    self.set_status(f"tk/s: {tokens/(curr_time - start_time):.2f}")
+                    start_time = curr_time
+                    tokens = 0
             elif event.type == "response.completed":
                 ret = event.response
                 pass
@@ -468,6 +470,22 @@ Remember: You're designed to be helpful while giving the user full control over 
         print(f"\nTokens used: {self.usage['total_tokens']}")
         return res
 
+    def save_session(self):
+        session_name = f"session_{datetime.datetime.now().isoformat()}.json"
+        with open(session_name, "w") as f:
+            json.dump(
+                {
+                    "input_list": self.input_list,
+                },
+                f,
+                indent=2,
+            )
+    
+    def load_session(self, session_name: str):
+        with open(session_name, "r") as f:
+            data = json.load(f)
+            self.input_list = data.get("input_list", [])
+
     def set_status(self, status: str):
         usage_label = self.query_one("#Status", Label)
         usage_label.update(status)
@@ -494,6 +512,21 @@ Remember: You're designed to be helpful while giving the user full control over 
         prompt = event.value.strip()
         if not prompt:
             return
+        if prompt[0] == "/":
+            command = prompt[1:].strip().split(' ')[0]
+            if command == "save":
+                self.save_session()
+                return
+            elif command == "load":
+                session_name = prompt[1:].strip().split(' ')[1] if len(prompt[1:].strip().split(' ')) > 1 else None
+                if session_name is None:
+                    return
+                self.load_session(session_name)
+                return
+            else:
+                scroll = self.query_one(VerticalScroll)
+                scroll.mount(Label(f"Unknown command: {command}", classes="user_prompt"))
+                return
         scroll = self.query_one(VerticalScroll)
         scroll.mount(Label(prompt, classes="user_prompt"))
         scroll.mount(Markdown())
@@ -502,7 +535,7 @@ Remember: You're designed to be helpful while giving the user full control over 
         self._prompt.styles.height = 3
         self.request_loop()
         self._prompt.focus()
-    
+
     @on(ChatInput.Changed)
     def on_chat_input_changed(self, event: ChatInput.Changed) -> None:
         text_area = event.text_area
